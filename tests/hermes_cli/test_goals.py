@@ -797,7 +797,7 @@ def test_oneshot_continue_sentinel_skips_llm_judge(hermes_home):
     assert "disk frontier" in decision["continuation_prompt"]
 
 
-def test_oneshot_continue_status_line_shows_judge_and_next_action(hermes_home):
+def test_oneshot_continue_status_line_shows_judge_reasoning_before_verdict_and_next_action(hermes_home):
     from hermes_cli import goals
     from hermes_cli.goals import GoalManager
 
@@ -806,6 +806,7 @@ def test_oneshot_continue_status_line_shows_judge_and_next_action(hermes_home):
 
     with patch.object(goals, "judge_goal") as judge:
         decision = mgr.evaluate_after_turn(
+            "Judge reasoning: GOAL.md is not satisfied and safe work remains\n"
             "/goal_prompt_oneshot continuation decision: CONTINUE\n"
             "GOAL.md definition of done: NOT SATISFIED\n"
             "Completed slice: refreshed the wrapper\n"
@@ -816,7 +817,8 @@ def test_oneshot_continue_status_line_shows_judge_and_next_action(hermes_home):
 
     judge.assert_not_called()
     assert decision["should_continue"] is True
-    assert "judge: CONTINUE" in decision["message"]
+    assert "judge: GOAL.md is not satisfied and safe work remains → CONTINUE" in decision["message"]
+    assert decision["message"].index("GOAL.md is not satisfied") < decision["message"].index("CONTINUE")
     assert "GOAL.md definition of done: NOT SATISFIED" in decision["message"]
     assert "next action: update the adapter" in decision["message"]
 
@@ -828,6 +830,7 @@ def test_oneshot_stop_for_operator_pauses_not_done(hermes_home):
     mgr.set("continue project", goal_mode="goal_prompt_oneshot")
 
     decision = mgr.evaluate_after_turn(
+        "Judge reasoning: no safe autonomous slice remains\n"
         "/goal_prompt_oneshot continuation decision: STOP_FOR_OPERATOR\n"
         "GOAL.md definition of done: NOT SATISFIED\n"
         "Reason: only production signing remains\n"
@@ -837,6 +840,8 @@ def test_oneshot_stop_for_operator_pauses_not_done(hermes_home):
     assert decision["verdict"] == "stop_for_operator"
     assert mgr.state.status == "paused"
     assert "operator" in (mgr.state.paused_reason or "")
+    assert "judge: no safe autonomous slice remains → STOP_FOR_OPERATOR" in decision["message"]
+    assert decision["message"].index("no safe autonomous slice remains") < decision["message"].index("STOP_FOR_OPERATOR")
 
 
 def test_oneshot_judge_uses_mode_aware_prompt(monkeypatch):

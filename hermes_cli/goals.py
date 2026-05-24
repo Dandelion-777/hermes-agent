@@ -98,10 +98,12 @@ ONESHOT_CONTINUATION_PROMPT_TEMPLATE = (
     "Before acting, re-read GOAL.md, NEXT_ACTIONS.md, GOAL_PROMPT.md, "
     "and SAFETY.md when present. Take the exact next safe autonomous slice "
     "from the updated docs. At the end of the slice, include a final "
-    "machine-readable continuation block using exactly one of CONTINUE, "
-    "STOP_FOR_OPERATOR, or COMPLETE. Use CONTINUE whenever GOAL.md is not "
-    "satisfied and NEXT_ACTIONS.md names safe autonomous work. Reserve "
-    "STOP_FOR_OPERATOR for true non-bypassable gates only."
+    "machine-readable continuation block with a Judge reasoning line "
+    "immediately before the continuation decision line. The decision must "
+    "use exactly one of CONTINUE, STOP_FOR_OPERATOR, or COMPLETE. Use "
+    "CONTINUE whenever GOAL.md is not satisfied and NEXT_ACTIONS.md names "
+    "safe autonomous work. Reserve STOP_FOR_OPERATOR for true "
+    "non-bypassable gates only."
 )
 
 
@@ -438,18 +440,35 @@ def _oneshot_done_line(last_response: str) -> str:
     return match.group("done").strip().upper() if match else ""
 
 
+def _oneshot_judge_reasoning(last_response: str) -> str:
+    """Return the explicit reasoning line that precedes a oneshot verdict."""
+    return (
+        _line_value(last_response, "Judge reasoning")
+        or _line_value(last_response, "Reasoning")
+        or _line_value(last_response, "Judge reason")
+    )
+
+
+def _oneshot_judge_verdict_summary(last_response: str, verdict: str, reason: str) -> str:
+    raw = _oneshot_decision_raw_label(last_response, verdict or "continue") or "CONTINUE"
+    reasoning = _oneshot_judge_reasoning(last_response) or _line_value(last_response, "Reason")
+    if reasoning:
+        return f"judge: {reasoning} → {raw}"
+    return f"judge: {raw}"
+
+
 def _oneshot_continue_status_reason(last_response: str, verdict: str, reason: str) -> str:
     """Build the user-visible CONTINUE line for /goal_prompt_oneshot.
 
-    The loop's machine-readable final block carries two distinct facts users
-    need between iterations: the deterministic judge/verdict block and the
-    exact next action. Preserve both in the one-line continuation banner so the
-    CLI/TUI no longer replaces the verdict with only the NEXT_ACTIONS text.
+    The loop's machine-readable final block carries three distinct facts users
+    need between iterations: the deterministic judge reasoning, the verdict,
+    and the exact next action. Preserve all of them in the one-line
+    continuation banner so the CLI/TUI no longer replaces the verdict with only
+    the NEXT_ACTIONS text.
     """
-    raw = _oneshot_decision_raw_label(last_response, verdict or "continue") or "CONTINUE"
     done_line = _oneshot_done_line(last_response)
     next_action = _line_value(last_response, "Next safe autonomous slice") or reason
-    parts = [f"judge: {raw}"]
+    parts = [_oneshot_judge_verdict_summary(last_response, verdict, reason)]
     if done_line:
         parts.append(f"GOAL.md definition of done: {done_line}")
     if next_action:
@@ -475,7 +494,8 @@ def parse_oneshot_continuation_decision(last_response: str) -> Optional[Tuple[st
         raw = _oneshot_decision_raw_label(text)
         done_line = _oneshot_done_line(text)
         reason = (
-            _line_value(text, "Reason")
+            _oneshot_judge_reasoning(text)
+            or _line_value(text, "Reason")
             or _line_value(text, "Next safe autonomous slice")
             or _line_value(text, "Completed slice")
             or raw
@@ -839,13 +859,19 @@ class GoalManager:
             state.status = "paused"
             state.paused_reason = f"operator direction required: {reason}"
             save_goal(self.session_id, state)
+            message = f"⏸ /goal_prompt_oneshot stopped for operator: {reason}"
+            if state.goal_mode == "goal_prompt_oneshot" and deterministic is not None:
+                message = (
+                    "⏸ /goal_prompt_oneshot stopped for operator: "
+                    f"{_oneshot_judge_verdict_summary(last_response, verdict, reason)}"
+                )
             return {
                 "status": "paused",
                 "should_continue": False,
                 "continuation_prompt": None,
                 "verdict": "stop_for_operator",
                 "reason": reason,
-                "message": f"⏸ /goal_prompt_oneshot stopped for operator: {reason}",
+                "message": message,
             }
 
         if verdict == "done":
