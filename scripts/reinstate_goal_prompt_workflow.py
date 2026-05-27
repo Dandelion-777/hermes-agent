@@ -183,6 +183,7 @@ def workflow_check(repo: Path) -> CheckResult:
                 "caption=None",
                 "_enqueue_goal_kickoff_event",
                 "missing /goal_prompt_oneshot continuation verdict",
+                "internal=False",
             ],
         ),
     ))

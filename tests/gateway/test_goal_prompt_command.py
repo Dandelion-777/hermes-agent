@@ -128,7 +128,7 @@ async def test_gateway_goal_prompt_oneshot_post_delivery_sends_docs_before_kicko
 
 
 @pytest.mark.asyncio
-async def test_gateway_goal_prompt_oneshot_continue_requeues_prompt_loader(tmp_path: Path, monkeypatch):
+async def test_gateway_goal_prompt_oneshot_continue_requeues_visible_prompt_loader(tmp_path: Path, monkeypatch):
     prompt = tmp_path / "docs" / "runbooks" / "GOAL_PROMPT.md"
     prompt.parent.mkdir(parents=True)
     prompt.write_text("```text\n/goal Continue project\n```", encoding="utf-8")
@@ -181,7 +181,7 @@ async def test_gateway_goal_prompt_oneshot_continue_requeues_prompt_loader(tmp_p
     assert notices
     assert "judge: GOAL.md is not satisfied and safe work remains" in notices[0]
     assert queued == [f"/goal_prompt_oneshot {prompt}"]
-    assert queued_events[0].internal is True
+    assert queued_events[0].internal is False
     state = goals.GoalManager("sid-requeue").state
     assert state.turns_used == 1
     goals._DB_CACHE.clear()
@@ -233,7 +233,7 @@ def test_gateway_session_split_carries_persisted_oneshot_goal_state(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_gateway_goal_prompt_oneshot_internal_reload_is_silent_but_queues(tmp_path: Path, monkeypatch):
+async def test_gateway_goal_prompt_oneshot_reload_returns_notice_and_queues(tmp_path: Path, monkeypatch):
     prompt = tmp_path / "docs" / "runbooks" / "GOAL_PROMPT.md"
     prompt.parent.mkdir(parents=True)
     prompt.write_text("```text\n/goal Continue silently\n```", encoding="utf-8")
@@ -261,13 +261,14 @@ async def test_gateway_goal_prompt_oneshot_internal_reload_is_silent_but_queues(
         text=f"/goal_prompt_oneshot {tmp_path}",
         message_type=MessageType.TEXT,
         source=SimpleNamespace(platform="telegram", chat_id="123"),
-        internal=True,
+        internal=False,
     )
 
     result = await runner._handle_goal_prompt_command(event, oneshot=True)
 
-    assert result == ""
-    assert registered["event_internal"] is True
+    assert "Loading one-shot goal prompt" in result
+    assert "Goal queued (0/250) (250-turn budget). Kickoff sent as the next turn." in result
+    assert registered["event_internal"] is False
     assert registered["goal_text"].startswith("Continue silently")
     assert prompt.resolve() in registered["docs"]
     state = goals.GoalManager("goal-prompt-oneshot-internal").state

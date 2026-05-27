@@ -11380,7 +11380,7 @@ class GatewayRunner:
                         source=source,
                         message_id=getattr(source, "message_id", None),
                         channel_prompt=None,
-                        internal=True,
+                        internal=False,
                     )
                     self._enqueue_fifo(session_key, reload_event, adapter)
                     return
