@@ -184,6 +184,8 @@ def workflow_check(repo: Path) -> CheckResult:
                 "_enqueue_goal_kickoff_event",
                 "_hermes_goal_prompt_oneshot",
                 "missing /goal_prompt_oneshot continuation verdict",
+                "context compactions; ",
+                "goal oneshot compaction refresh notice failed",
                 "internal=False",
             ],
         ),
@@ -212,6 +214,7 @@ def workflow_check(repo: Path) -> CheckResult:
                 "registered_generation",
                 "plain_message_does_not_restart_without_verdict",
                 "continue_requeues_visible_prompt_loader",
+                "compaction_refresh_sends_visible_notice_before_reload",
                 "reload_returns_notice_and_queues",
                 "pause_clears_stale_oneshot_loader_when_no_goal_state",
                 "pause_clears_stale_oneshot_post_delivery_callback_without_goal_state",
@@ -360,7 +363,8 @@ def self_test() -> None:
             "_maybe_refresh_oneshot_goal_after_compactions goal_prompt_document_paths "
             "_send_goal_prompt_documents _register_goal_prompt_oneshot_post_delivery "
             "register_post_delivery_callback send_document _enqueue_goal_kickoff_event "
-            "After the loading notice is delivered, send docs, then queue kickoff",
+            "After the loading notice is delivered, send docs, then queue kickoff "
+            "context compactions; goal oneshot compaction refresh notice failed",
             encoding="utf-8",
         )
         (root / "tui_gateway/server.py").write_text(

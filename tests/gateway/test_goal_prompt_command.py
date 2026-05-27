@@ -150,7 +150,10 @@ async def test_gateway_goal_prompt_oneshot_continue_requeues_visible_prompt_load
     runner.config = {"goals": {"oneshot_max_turns": 250, "oneshot_compaction_refresh_interval": 5}}
     runner.adapters = {"telegram": object()}
     runner._session_key_for_source = lambda _source: "session-key"
-    runner._maybe_refresh_oneshot_goal_after_compactions_gateway = lambda **_kwargs: False
+    async def fake_refresh(**_kwargs):
+        return False
+
+    runner._maybe_refresh_oneshot_goal_after_compactions_gateway = fake_refresh
     notices = []
     queued = []
     queued_events = []
@@ -184,6 +187,67 @@ async def test_gateway_goal_prompt_oneshot_continue_requeues_visible_prompt_load
     assert queued_events[0].internal is False
     state = goals.GoalManager("sid-requeue").state
     assert state.turns_used == 1
+    goals._DB_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_gateway_goal_prompt_oneshot_compaction_refresh_sends_visible_notice_before_reload(tmp_path: Path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import goals
+    goals._DB_CACHE.clear()
+
+    prompt = tmp_path / "docs" / "runbooks" / "GOAL_PROMPT.md"
+    prompt.parent.mkdir(parents=True)
+    prompt.write_text("```text\n/goal Continue project\n```", encoding="utf-8")
+
+    state = goals.GoalManager("sid-before-refresh", default_max_turns=250).set(
+        "Continue project",
+        max_turns=250,
+        goal_mode="goal_prompt_oneshot",
+        goal_prompt_path=str(prompt),
+        compaction_refresh_interval=5,
+    )
+    state.turns_used = 5
+    goals.save_goal("sid-before-refresh", state)
+
+    order = []
+
+    class FakeAdapter:
+        async def send(self, chat_id, message, metadata=None):
+            order.append(("notice", chat_id, message))
+            return SimpleNamespace(success=True)
+
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {"telegram": FakeAdapter()}
+    runner.session_store = SimpleNamespace(
+        reset_session=lambda _session_key: SimpleNamespace(session_id="sid-after-refresh")
+    )
+    runner._session_key_for_source = lambda _source: "session-key"
+    runner._agent_compression_count_for_session_key = lambda _session_key: 5
+    runner._thread_metadata_for_source = lambda *_args, **_kwargs: {}
+    runner._clear_goal_pending_continuations = lambda *_args, **_kwargs: None
+    runner._evict_cached_agent = lambda *_args, **_kwargs: None
+    runner._clear_session_boundary_security_state = lambda *_args, **_kwargs: None
+    runner._enqueue_fifo = lambda _key, event, _adapter: order.append(("reload", event.text, event.internal))
+
+    refreshed = await runner._maybe_refresh_oneshot_goal_after_compactions_gateway(
+        mgr=SimpleNamespace(state=state),
+        session_entry=SimpleNamespace(session_id="sid-before-refresh"),
+        source=SimpleNamespace(platform="telegram", chat_id="123", message_id="msg-1"),
+    )
+
+    assert refreshed is True
+    assert order == [
+        (
+            "notice",
+            "123",
+            "↺ /goal_prompt_oneshot reached 5 context compactions; "
+            "starting a fresh /new session and reloading GOAL_PROMPT.md.",
+        ),
+        ("reload", f"/goal_prompt_oneshot {prompt}", True),
+    ]
     goals._DB_CACHE.clear()
 
 
@@ -362,7 +426,10 @@ async def test_gateway_goal_prompt_oneshot_plain_message_does_not_restart_withou
     adapter = FakeAdapter()
     runner.adapters = {"telegram": adapter}
     runner._session_key_for_source = lambda _source: "session-key"
-    runner._maybe_refresh_oneshot_goal_after_compactions_gateway = lambda **_kwargs: False
+    async def fake_refresh(**_kwargs):
+        return False
+
+    runner._maybe_refresh_oneshot_goal_after_compactions_gateway = fake_refresh
     runner._defer_goal_status_notice_after_delivery = lambda *_args, **_kwargs: None
 
     def fake_enqueue(_key, event, _adapter):

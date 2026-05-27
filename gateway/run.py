@@ -11230,7 +11230,7 @@ class GatewayRunner:
             )
             return False
 
-    def _maybe_refresh_oneshot_goal_after_compactions_gateway(
+    async def _maybe_refresh_oneshot_goal_after_compactions_gateway(
         self,
         *,
         mgr: Any,
@@ -11256,6 +11256,16 @@ class GatewayRunner:
             adapter = self.adapters.get(source.platform)
             if not adapter:
                 return False
+            try:
+                await self._send_goal_status_notice(
+                    source,
+                    (
+                        f"↺ /goal_prompt_oneshot reached {compression_count} context compactions; "
+                        "starting a fresh /new session and reloading GOAL_PROMPT.md."
+                    ),
+                )
+            except Exception as exc:
+                logger.debug("goal oneshot compaction refresh notice failed: %s", exc)
             # Start a fresh gateway session and enqueue the slash command so the
             # normal /goal_prompt_oneshot loader re-reads GOAL_PROMPT.md from disk.
             try:
@@ -11376,7 +11386,7 @@ class GatewayRunner:
         if not decision.get("should_continue"):
             return
 
-        if self._maybe_refresh_oneshot_goal_after_compactions_gateway(
+        if await self._maybe_refresh_oneshot_goal_after_compactions_gateway(
             mgr=mgr, session_entry=session_entry, source=source
         ):
             return
