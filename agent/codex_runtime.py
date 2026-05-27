@@ -211,6 +211,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     """Execute one streaming Responses API request and return the final response."""
     import httpx as _httpx
 
+    api_kwargs = agent._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1
     has_tool_calls = False

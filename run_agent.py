@@ -3204,8 +3204,13 @@ class AIAgent:
         delivered = False
         for cb in callbacks:
             try:
-                cb(text)
-                delivered = True
+                # A callback may return False to request provider streaming for
+                # side-channel events (for example early tool-call generation)
+                # without claiming the text delta was actually delivered to the
+                # user. Existing display/TTS callbacks return None and keep the
+                # legacy delivered=True behavior.
+                if cb(text) is not False:
+                    delivered = True
             except Exception:
                 pass
         if delivered:

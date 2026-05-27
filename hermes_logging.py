@@ -355,10 +355,16 @@ def _add_rotating_handler(
             return  # already attached
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    handler = _ManagedRotatingFileHandler(
-        str(path), maxBytes=max_bytes, backupCount=backup_count,
-        encoding="utf-8",
-    )
+    try:
+        handler = _ManagedRotatingFileHandler(
+            str(path), maxBytes=max_bytes, backupCount=backup_count,
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logging.getLogger(__name__).debug(
+            "Skipping Hermes log handler for %s: %s", path, exc
+        )
+        return
     handler.setLevel(level)
     handler.setFormatter(formatter)
     if log_filter is not None:

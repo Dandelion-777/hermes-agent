@@ -124,11 +124,11 @@ async def test_goal_verdict_done_sent_via_adapter_send(hermes_home):
 
 
 @pytest.mark.asyncio
-async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
-    """When the judge says continue, both the 'continuing' status and the
-    continuation-prompt event must be delivered. The continuation prompt is
-    routed through the adapter's pending-messages FIFO so the goal loop
-    proceeds on the next turn."""
+async def test_goal_verdict_continue_enqueues_continuation_without_regular_goal_banner(hermes_home):
+    """Regular /goal and /goal_prompt CONTINUE verdicts should silently
+    enqueue the next turn. The visible ``↻ Continuing toward goal`` status
+    banner is reserved for /goal_prompt_oneshot controller loops.
+    """
     runner, adapter, session_entry, src = _make_runner_with_adapter()
 
     from hermes_cli.goals import GoalManager
@@ -144,9 +144,7 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
         )
         await asyncio.sleep(0.05)
 
-    # Status line sent back
-    assert len(adapter.sends) == 1
-    assert "Continuing toward goal" in adapter.sends[0]["content"]
+    assert adapter.sends == []
     # Continuation prompt enqueued for next turn
     assert adapter._pending_messages, "continuation prompt must be enqueued in pending_messages"
 
@@ -219,3 +217,70 @@ async def test_goal_verdict_survives_adapter_without_send(hermes_home):
             final_response="whatever",
         )
         await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_goal_verdict_continue_runs_for_already_sent_streamed_response(hermes_home):
+    """Streaming/Codex may deliver the final answer itself and mark
+    ``already_sent=True``. The gateway must still evaluate the final response
+    for /goal continuation before returning None to suppress duplicate sends.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from gateway.platforms.base import MessageEvent, MessageType
+    from hermes_cli.goals import GoalManager
+
+    runner, adapter, session_entry, src = _make_runner_with_adapter("sid-streamed-goal")
+    GoalManager(session_entry.session_id).set("continue after streamed answer")
+    deferred_callbacks = []
+    adapter.register_post_delivery_callback = lambda *_args, **_kwargs: deferred_callbacks.append(_args[1])
+
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    runner._recover_telegram_topic_thread_id = lambda _source: None
+    runner._cache_session_source = lambda *_args, **_kwargs: None
+    runner._is_telegram_topic_lane = lambda _source: False
+    runner._set_session_env = lambda _context: []
+    runner._clear_session_env = lambda _tokens: None
+    runner._prepare_inbound_message_text = AsyncMock(return_value="continue the goal")
+    runner._bind_adapter_run_generation = lambda *_args, **_kwargs: None
+    runner._is_session_run_current = lambda *_args, **_kwargs: True
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner._deliver_media_from_response = AsyncMock()
+    runner._thread_metadata_for_source = lambda *_args, **_kwargs: {}
+    runner._reply_anchor_for_event = lambda _event: None
+    runner._clear_restart_failure_count = lambda _session_key: None
+    runner._session_model_overrides = {}
+    runner._set_session_reasoning_override = lambda *_args, **_kwargs: None
+    runner._session_db = None
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_any_sessions.return_value = True
+
+    final_response = "partial work done; continue"
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": final_response,
+        "already_sent": True,
+        "failed": False,
+        "messages": [
+            {"role": "user", "content": "continue the goal"},
+            {"role": "assistant", "content": final_response},
+        ],
+        "history_offset": 0,
+        "api_calls": 1,
+    })
+
+    event = MessageEvent(
+        text="continue the goal",
+        message_type=MessageType.TEXT,
+        source=src,
+        message_id="msg-1",
+    )
+
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "streamed but more remains", False)):
+        result = await runner._handle_message_with_agent(event, src, session_entry.session_key, run_generation=1)
+        await asyncio.sleep(0.05)
+
+    assert result is None
+    assert not any("Continuing toward goal" in send["content"] for send in adapter.sends)
+    assert deferred_callbacks == []
+    assert adapter._pending_messages, "streamed already_sent final response must still enqueue goal continuation"

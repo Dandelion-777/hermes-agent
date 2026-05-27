@@ -25,12 +25,12 @@ import httpx
 from run_agent import AIAgent, _get_proxy_from_env, _get_proxy_for_base_url
 
 
-def _make_agent():
+def _make_agent(*, provider="openrouter", base_url="https://openrouter.ai/api/v1"):
     return AIAgent(
         api_key="test-key",
-        base_url="https://chatgpt.com/backend-api/codex",
-        provider="openai-codex",
-        model="gpt-5.4",
+        base_url=base_url,
+        provider=provider,
+        model="test/model",
         quiet_mode=True,
         skip_context_files=True,
         skip_memory=True,
@@ -91,7 +91,7 @@ def test_create_openai_client_routes_via_proxy_when_env_set(mock_openai, monkeyp
     agent = _make_agent()
     kwargs = {
         "api_key": "test-key",
-        "base_url": "https://chatgpt.com/backend-api/codex",
+        "base_url": "https://openrouter.ai/api/v1",
     }
     agent._create_openai_client(kwargs, reason="test", shared=False)
 
@@ -126,7 +126,7 @@ def test_create_openai_client_no_proxy_when_env_unset(mock_openai, monkeypatch):
     agent = _make_agent()
     kwargs = {
         "api_key": "test-key",
-        "base_url": "https://chatgpt.com/backend-api/codex",
+        "base_url": "https://openrouter.ai/api/v1",
     }
     agent._create_openai_client(kwargs, reason="test", shared=False)
 
@@ -143,6 +143,50 @@ def test_create_openai_client_no_proxy_when_env_unset(mock_openai, monkeypatch):
         "pools were %r" % (pool_types,)
     )
     http_client.close()
+
+
+@patch("run_agent.OpenAI")
+def test_create_openai_client_skips_keepalive_for_openai_codex_provider(mock_openai, monkeypatch):
+    """Do not inject Hermes' custom keepalive transport for ChatGPT Codex.
+
+    Regression guard for #12952/#12953: the ChatGPT Codex backend may reset
+    the TLS handshake when Hermes passes a custom httpx transport with socket
+    options. Let the OpenAI SDK use its default transport for this backend.
+    """
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                "https_proxy", "http_proxy", "all_proxy"):
+        monkeypatch.delenv(key, raising=False)
+
+    agent = _make_agent(
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+    )
+    kwargs = {
+        "api_key": "test-key",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+    }
+    agent._create_openai_client(kwargs, reason="test", shared=False)
+
+    forwarded = mock_openai.call_args.kwargs
+    assert "http_client" not in forwarded
+
+
+@patch("run_agent.OpenAI")
+def test_create_openai_client_skips_keepalive_for_chatgpt_codex_base_url(mock_openai, monkeypatch):
+    """Also bypass keepalive by base URL for custom-provider Codex routing."""
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                "https_proxy", "http_proxy", "all_proxy"):
+        monkeypatch.delenv(key, raising=False)
+
+    agent = _make_agent(provider="custom", base_url="https://chatgpt.com/backend-api/codex/")
+    kwargs = {
+        "api_key": "test-key",
+        "base_url": "https://chatgpt.com/backend-api/codex/",
+    }
+    agent._create_openai_client(kwargs, reason="test", shared=False)
+
+    forwarded = mock_openai.call_args.kwargs
+    assert "http_client" not in forwarded
 
 
 def test_get_proxy_for_base_url_returns_none_when_host_bypassed(monkeypatch):

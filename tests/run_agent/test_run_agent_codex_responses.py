@@ -335,6 +335,21 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert "extra_body" not in kwargs
 
 
+def test_responses_transport_omits_none_tools():
+    """OpenAI SDK 2.24 iterates tools directly; ``tools=None`` must be omitted."""
+    from agent.transports.codex import ResponsesApiTransport
+
+    kwargs = ResponsesApiTransport().build_kwargs(
+        "gpt-5-codex",
+        [{"role": "user", "content": "Ping"}],
+        tools=None,
+    )
+
+    assert "tools" not in kwargs
+    assert "tool_choice" not in kwargs
+    assert "parallel_tool_calls" not in kwargs
+
+
 def test_build_api_kwargs_codex_clamps_minimal_effort(monkeypatch):
     """'minimal' reasoning effort is clamped to 'low' on the Responses API.
 
@@ -440,6 +455,25 @@ def test_run_codex_stream_retries_when_completed_event_missing(monkeypatch):
     response = agent._run_codex_stream(_codex_request_kwargs())
     assert calls["stream"] == 2
     assert response.output[0].content[0].text == "stream ok"
+
+
+def test_run_codex_stream_preflights_none_tools_before_sdk(monkeypatch):
+    """Direct callers of _run_codex_stream also get sanitized kwargs."""
+    agent = _build_agent(monkeypatch)
+
+    def _fake_stream(**kwargs):
+        assert "tools" not in kwargs
+        return _FakeResponsesStream(final_response=_codex_message_response("ok"))
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=lambda **kwargs: _codex_message_response("fallback"),
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+    assert response.output[0].content[0].text == "ok"
 
 
 def test_run_codex_stream_falls_back_to_create_after_stream_completion_error(monkeypatch):

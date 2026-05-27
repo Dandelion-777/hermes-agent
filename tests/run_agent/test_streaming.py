@@ -760,6 +760,24 @@ class TestHasStreamConsumers:
         assert agent._has_stream_consumers() is True
 
 
+    def test_delta_callback_return_false_does_not_record_text_as_delivered(self):
+        from run_agent import AIAgent
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=lambda _text: False,
+        )
+
+        agent._fire_stream_delta("hidden gateway final prose")
+
+        assert agent._has_stream_consumers() is True
+        assert getattr(agent, "_current_streamed_assistant_text", "") == ""
+
+
 # ── Test: Codex stream fires callbacks ────────────────────────────────
 
 

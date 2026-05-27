@@ -2515,6 +2515,46 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert fake_client.responses.kwargs["timeout"] == 12.5
         assert response.choices[0].message.content == "summary"
 
+    def test_omits_none_tools_before_responses_stream(self):
+        """OpenAI SDK 2.24 raises TypeError when Responses tools=None is passed."""
+        class FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return iter(())
+
+            def get_final_response(self):
+                return SimpleNamespace(
+                    output=[SimpleNamespace(
+                        type="message",
+                        content=[SimpleNamespace(type="output_text", text="title")],
+                    )],
+                    usage=None,
+                )
+
+        class FakeResponses:
+            def __init__(self):
+                self.kwargs = None
+
+            def stream(self, **kwargs):
+                self.kwargs = kwargs
+                return FakeStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        response = adapter.create(
+            messages=[{"role": "user", "content": "name this chat"}],
+            tools=None,
+        )
+
+        assert "tools" not in fake_client.responses.kwargs
+        assert response.choices[0].message.content == "title"
+
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
         class SlowAliveStream:
             def __enter__(self):

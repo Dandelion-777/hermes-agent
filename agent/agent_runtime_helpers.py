@@ -1309,7 +1309,12 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # constructs a fresh one — no stale closed transport can be reused.
     # Tests in ``tests/run_agent/test_create_openai_client_reuse.py`` and
     # ``tests/run_agent/test_sequential_chats_live.py`` pin this invariant.
-    if "http_client" not in client_kwargs:
+    base_url = str(client_kwargs.get("base_url", "") or "")
+    is_chatgpt_codex_backend = (
+        getattr(agent, "provider", None) == "openai-codex"
+        or base_url.rstrip("/").startswith("https://chatgpt.com/backend-api/codex")
+    )
+    if "http_client" not in client_kwargs and not is_chatgpt_codex_backend:
         keepalive_http = agent._build_keepalive_http_client(client_kwargs.get("base_url", ""))
         if keepalive_http is not None:
             client_kwargs["http_client"] = keepalive_http

@@ -2631,7 +2631,11 @@ class GatewayRunner:
         suppressing them.
         """
         text = getattr(event_or_text, "text", event_or_text) or ""
-        return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
+        return (
+            str(text).startswith("[Continuing toward your standing goal]\nGoal:")
+            or str(text).startswith("[Continuing /goal_prompt_oneshot from disk frontier]\nGoal:")
+            or str(text).startswith("/goal_prompt_oneshot ")
+        )
 
     def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
         """Remove queued synthetic /goal continuations for one session.
@@ -7180,6 +7184,10 @@ class GatewayRunner:
                     return await self._handle_goal_command(event)
                 return "Agent is running — use /goal status / pause / clear mid-run, or /stop before setting a new goal."
 
+            if _cmd_def_inner and _cmd_def_inner.name in {"goal-prompt", "goal-prompt-oneshot"}:
+                usage = "/goal_prompt_oneshot" if _cmd_def_inner.name == "goal-prompt-oneshot" else "/goal_prompt"
+                return f"Agent is running — wait or /stop first, then load a GOAL_PROMPT.md with {usage}."
+
             # /subgoal is safe mid-run — it only modifies the goal's
             # subgoals list, which the judge reads at the next turn
             # boundary. No race with the running turn.
@@ -7588,6 +7596,12 @@ class GatewayRunner:
 
         if canonical == "goal":
             return await self._handle_goal_command(event)
+
+        if canonical == "goal-prompt":
+            return await self._handle_goal_prompt_command(event)
+
+        if canonical == "goal-prompt-oneshot":
+            return await self._handle_goal_prompt_command(event, oneshot=True)
 
         if canonical == "subgoal":
             return await self._handle_subgoal_command(event)
@@ -9062,6 +9076,23 @@ class GatewayRunner:
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
             if agent_result.get("already_sent") and not agent_result.get("failed"):
+                # Streaming/Codex delivery suppresses the normal return value to
+                # avoid sending a duplicate final message.  The outer
+                # _handle_message() goal hook only sees returned text, so run the
+                # standing-goal continuation here while the real final_response is
+                # still available.  Otherwise /goal and /goal_prompt_oneshot can
+                # visibly end with CONTINUE but never enqueue the next turn.
+                if response and session_entry is not None:
+                    try:
+                        await self._post_turn_goal_continuation(
+                            session_entry=session_entry,
+                            source=source,
+                            final_response=response,
+                            response_already_delivered=True,
+                        )
+                    except Exception as _goal_exc:
+                        logger.debug("goal continuation hook failed after streamed delivery: %s", _goal_exc)
+
                 if response:
                     _media_adapter = self.adapters.get(source.platform)
                     if _media_adapter:
@@ -10689,6 +10720,29 @@ class GatewayRunner:
         except Exception:
             return 20
 
+    def _goal_oneshot_config(self) -> dict:
+        try:
+            goals_cfg = (
+                (self.config or {}).get("goals", {})
+                if isinstance(self.config, dict)
+                else getattr(self.config, "goals", {}) or {}
+            )
+            if not goals_cfg:
+                from hermes_cli.config import load_config
+
+                goals_cfg = (load_config() or {}).get("goals") or {}
+        except Exception:
+            goals_cfg = {}
+        try:
+            max_turns = int(goals_cfg.get("oneshot_max_turns", 250) or 250)
+        except Exception:
+            max_turns = 250
+        try:
+            interval = int(goals_cfg.get("oneshot_compaction_refresh_interval", 5) or 0)
+        except Exception:
+            interval = 5
+        return {"max_turns": max_turns, "compaction_refresh_interval": max(0, interval)}
+
     def _get_goal_manager_for_event(self, event: "MessageEvent"):
         """Return a GoalManager bound to the session for this gateway event.
 
@@ -10710,6 +10764,203 @@ class GatewayRunner:
             return None, None
         max_turns = self._goal_max_turns_from_config()
         return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
+
+    async def _handle_goal_prompt_command(self, event: "MessageEvent", *, oneshot: bool = False) -> str:
+        """Load a GOAL_PROMPT.md-style file and dispatch it through /goal."""
+        from hermes_cli.goal_prompt import (
+            extract_goal_prompt_text,
+            goal_prompt_document_paths,
+            goal_command_from_prompt_text,
+            resolve_goal_prompt_path,
+        )
+
+        args = (event.get_command_args() or "").strip()
+        command_name = "/goal_prompt_oneshot" if oneshot else "/goal_prompt"
+        prompt_path = resolve_goal_prompt_path(args, search_parents=not oneshot)
+        if prompt_path is None or not prompt_path.exists():
+            return (
+                "No GOAL_PROMPT.md found.\n"
+                f"Expected: `{prompt_path or 'docs/runbooks/GOAL_PROMPT.md'}`\n"
+                f"Usage: `{command_name} [project-root-or-prompt-file]`"
+            )
+
+        try:
+            raw = prompt_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            return f"Failed to read `{prompt_path}`: {exc}"
+
+        prompt_text = extract_goal_prompt_text(raw)
+        command_to_run = goal_command_from_prompt_text(prompt_text, oneshot=oneshot)
+        if not command_to_run:
+            return f"`{prompt_path}` is empty or has no prompt text."
+
+        if oneshot:
+            goal_text = command_to_run.split(None, 1)[1].strip() if " " in command_to_run else ""
+            if not goal_text:
+                return f"`{prompt_path}` is empty or has no prompt text."
+
+            mgr, _session_entry = self._get_goal_manager_for_event(event)
+            if mgr is None:
+                return t("gateway.goal.unavailable")
+
+            cfg = self._goal_oneshot_config()
+            previous_turns = 0
+            previous_state = getattr(mgr, "state", None)
+            if (
+                previous_state is not None
+                and getattr(previous_state, "goal_mode", "") == "goal_prompt_oneshot"
+                and getattr(previous_state, "status", None) in {"active", "paused"}
+            ):
+                previous_turns = int(getattr(previous_state, "turns_used", 0) or 0)
+
+            try:
+                from hermes_cli.goals import save_goal
+
+                state = mgr.set(
+                    goal_text,
+                    max_turns=cfg["max_turns"],
+                    goal_mode="goal_prompt_oneshot",
+                    goal_prompt_path=str(prompt_path),
+                    compaction_refresh_interval=cfg["compaction_refresh_interval"],
+                )
+                state.turns_used = max(0, previous_turns)
+                save_goal(mgr.session_id, state)
+            except ValueError as exc:
+                return t("gateway.goal.invalid", error=str(exc))
+
+            docs = goal_prompt_document_paths(prompt_path, prompt_text)
+            self._register_goal_prompt_oneshot_post_delivery(
+                event,
+                state.goal,
+                docs,
+            )
+
+            # Internal one-shot reload events are implementation detail, not
+            # user-visible slash-command replies. They still refresh goal state,
+            # send docs, and queue the kickoff via the post-delivery callback
+            # fired by the adapter's finally block.
+            if getattr(event, "internal", False):
+                return ""
+
+            lines = [
+                f"⊙ Loading one-shot goal prompt from {prompt_path}",
+                "",
+                (
+                    f"⊙ Goal queued ({state.turns_used}/{state.max_turns}) "
+                    f"({state.max_turns}-turn budget). Kickoff sent as the next turn."
+                ),
+            ]
+            if state.compaction_refresh_interval > 0:
+                lines.extend([
+                    "",
+                    (
+                        f"↻ Will refresh after {state.compaction_refresh_interval} "
+                        "compactions with a fresh session reload."
+                    ),
+                ])
+            return "\n".join(lines)
+
+        original_text = event.text
+        old_metadata = getattr(self, "_pending_goal_metadata", None)
+        try:
+            if oneshot:
+                cfg = self._goal_oneshot_config()
+                self._pending_goal_metadata = {
+                    "goal_mode": "goal_prompt_oneshot",
+                    "goal_prompt_path": str(prompt_path),
+                    "compaction_refresh_interval": cfg["compaction_refresh_interval"],
+                    "max_turns": cfg["max_turns"],
+                }
+            event.text = command_to_run
+            result = await self._handle_goal_command(event)
+        finally:
+            event.text = original_text
+            self._pending_goal_metadata = old_metadata
+
+        mode = "one-shot goal prompt" if oneshot else "goal prompt"
+        return f"⊙ Loading {mode} from `{prompt_path}`\n{result}"
+
+    def _enqueue_goal_kickoff_event(self, event: "MessageEvent", goal_text: str) -> bool:
+        """Queue the first /goal turn while preserving platform thread context."""
+        try:
+            adapter = self.adapters.get(event.source.platform) if event.source else None
+            session_key = self._session_key_for_source(event.source) if event.source else None
+            if not adapter or not session_key:
+                return False
+            kickoff_event = MessageEvent(
+                text=goal_text,
+                message_type=MessageType.TEXT,
+                source=event.source,
+                message_id=event.message_id,
+                reply_to_message_id=getattr(event, "reply_to_message_id", None),
+                channel_prompt=event.channel_prompt,
+            )
+            self._enqueue_fifo(session_key, kickoff_event, adapter)
+            return True
+        except Exception as exc:
+            logger.debug("goal kickoff enqueue failed: %s", exc)
+            return False
+
+    async def _send_goal_prompt_documents(
+        self,
+        event: "MessageEvent",
+        docs: list[Path],
+    ) -> None:
+        """Send GOAL_PROMPT-associated docs before the kickoff turn starts."""
+        if not docs or event.source is None:
+            return
+        adapter = self.adapters.get(event.source.platform)
+        if not adapter or not hasattr(adapter, "send_document"):
+            return
+        try:
+            metadata = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+        except Exception:
+            metadata = None
+        for path in docs:
+            try:
+                result = await adapter.send_document(
+                    event.source.chat_id,
+                    str(path),
+                    caption=None,
+                    file_name=path.name,
+                    reply_to=self._reply_anchor_for_event(event),
+                    metadata=metadata,
+                )
+                if result is not None and not getattr(result, "success", True):
+                    logger.warning("goal prompt document send failed for %s: %s", path, getattr(result, "error", "unknown error"))
+            except Exception as exc:
+                logger.warning("goal prompt document send failed for %s: %s", path, exc, exc_info=True)
+
+    def _register_goal_prompt_oneshot_post_delivery(
+        self,
+        event: "MessageEvent",
+        goal_text: str,
+        docs: list[Path],
+    ) -> None:
+        """After the loading notice is delivered, send docs, then queue kickoff."""
+        adapter = self.adapters.get(event.source.platform) if event.source else None
+        session_key = self._session_key_for_source(event.source) if event.source else None
+        if not adapter or not session_key or not hasattr(adapter, "register_post_delivery_callback"):
+            self._enqueue_goal_kickoff_event(event, goal_text)
+            return
+
+        async def _after_loading_notice() -> None:
+            await self._send_goal_prompt_documents(event, docs)
+            self._enqueue_goal_kickoff_event(event, goal_text)
+
+        try:
+            generation = None
+            active = getattr(adapter, "_active_sessions", {}).get(session_key)
+            if active is not None:
+                generation = getattr(active, "_hermes_run_generation", None)
+            adapter.register_post_delivery_callback(
+                session_key,
+                _after_loading_notice,
+                generation=generation,
+            )
+        except Exception as exc:
+            logger.debug("goal prompt post-delivery registration failed: %s", exc)
+            self._enqueue_goal_kickoff_event(event, goal_text)
 
     async def _handle_goal_command(self, event: "MessageEvent") -> str:
         """Handle /goal for gateway platforms.
@@ -10765,7 +11016,14 @@ class GatewayRunner:
 
         # Otherwise — treat the remaining text as the new goal.
         try:
-            state = mgr.set(args)
+            metadata = getattr(self, "_pending_goal_metadata", None) or {}
+            state = mgr.set(
+                args,
+                max_turns=int(metadata.get("max_turns", 0) or 0) or None,
+                goal_mode=str(metadata.get("goal_mode") or ""),
+                goal_prompt_path=str(metadata.get("goal_prompt_path") or ""),
+                compaction_refresh_interval=int(metadata.get("compaction_refresh_interval", 0) or 0),
+            )
         except ValueError as exc:
             return t("gateway.goal.invalid", error=str(exc))
 
@@ -10901,12 +11159,133 @@ class GatewayRunner:
 
         await _deliver()
 
+    def _agent_compression_count_for_session_key(self, session_key: str) -> int:
+        try:
+            cached = getattr(self, "_agent_cache", {}).get(session_key)
+            agent = cached[0] if isinstance(cached, tuple) else cached
+            comp = getattr(agent, "context_compressor", None)
+            return int(getattr(comp, "compression_count", 0) or 0)
+        except Exception:
+            return 0
+
+    def _carry_goal_state_between_sessions(
+        self,
+        old_session_id: str,
+        new_session_id: str,
+        *,
+        reason: str = "session-switch",
+    ) -> bool:
+        """Copy active/paused durable goal state across logical session splits.
+
+        Gateway turns can compress mid-run and mutate ``agent.session_id``.
+        The session store then points future messages at the child transcript,
+        but /goal state is persisted separately under ``goal:<session_id>``.
+        If we do not copy that row before post-turn evaluation, a valid
+        /goal_prompt_oneshot CONTINUE block becomes inert in the child session.
+        """
+        old_session_id = (old_session_id or "").strip()
+        new_session_id = (new_session_id or "").strip()
+        if not old_session_id or not new_session_id or old_session_id == new_session_id:
+            return False
+        try:
+            from copy import deepcopy
+            from hermes_cli.goals import load_goal, save_goal
+
+            state = load_goal(old_session_id)
+            if state is None or getattr(state, "status", None) not in {"active", "paused"}:
+                return False
+            save_goal(new_session_id, deepcopy(state))
+            logger.debug(
+                "carried goal state %s → %s after %s",
+                old_session_id,
+                new_session_id,
+                reason,
+            )
+            return True
+        except Exception as exc:
+            logger.debug(
+                "goal state carry %s → %s failed after %s: %s",
+                old_session_id,
+                new_session_id,
+                reason,
+                exc,
+            )
+            return False
+
+    def _maybe_refresh_oneshot_goal_after_compactions_gateway(
+        self,
+        *,
+        mgr: Any,
+        session_entry: Any,
+        source: Any,
+    ) -> bool:
+        state = getattr(mgr, "state", None)
+        if state is None or getattr(state, "status", None) != "active":
+            return False
+        if getattr(state, "goal_mode", "") != "goal_prompt_oneshot":
+            return False
+        interval = int(getattr(state, "compaction_refresh_interval", 0) or 0)
+        if interval <= 0 or source is None:
+            return False
+        session_key = self._session_key_for_source(source)
+        compression_count = self._agent_compression_count_for_session_key(session_key)
+        if compression_count < interval:
+            return False
+        prompt_path = (getattr(state, "goal_prompt_path", "") or "").strip()
+        if not prompt_path:
+            return False
+        try:
+            adapter = self.adapters.get(source.platform)
+            if not adapter:
+                return False
+            # Start a fresh gateway session and enqueue the slash command so the
+            # normal /goal_prompt_oneshot loader re-reads GOAL_PROMPT.md from disk.
+            try:
+                self._clear_goal_pending_continuations(session_key, adapter)
+            except Exception:
+                pass
+            try:
+                self._evict_cached_agent(session_key)
+            except Exception:
+                pass
+            new_entry = self.session_store.reset_session(session_key)
+            if new_entry is not None and session_entry is not None:
+                try:
+                    session_entry.session_id = new_entry.session_id
+                except Exception:
+                    pass
+                try:
+                    from copy import deepcopy
+                    from hermes_cli.goals import save_goal
+
+                    save_goal(new_entry.session_id, deepcopy(state))
+                except Exception as exc:
+                    logger.debug("goal oneshot compaction refresh state carry failed: %s", exc)
+            try:
+                self._clear_session_boundary_security_state(session_key)
+            except Exception:
+                pass
+            reload_event = MessageEvent(
+                text=f"/goal_prompt_oneshot {prompt_path}",
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=getattr(source, "message_id", None),
+                channel_prompt=None,
+                internal=True,
+            )
+            self._enqueue_fifo(session_key, reload_event, adapter)
+            return True
+        except Exception as exc:
+            logger.debug("goal oneshot compaction refresh failed: %s", exc)
+            return False
+
     async def _post_turn_goal_continuation(
         self,
         *,
         session_entry: Any,
         source: Any,
         final_response: str,
+        response_already_delivered: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -10919,7 +11298,7 @@ class GatewayRunner:
         queue and takes priority naturally.
         """
         try:
-            from hermes_cli.goals import GoalManager
+            from hermes_cli.goals import GoalManager, parse_oneshot_continuation_decision, save_goal
         except Exception as exc:
             logger.debug("goal continuation: goals module unavailable: %s", exc)
             return
@@ -10934,8 +11313,35 @@ class GatewayRunner:
         if not mgr.is_active():
             return
 
+        state = getattr(mgr, "state", None)
+        if state is not None and getattr(state, "goal_mode", "") == "goal_prompt_oneshot":
+            # A /goal_prompt_oneshot controller turn is allowed to advance only
+            # from its deterministic final verdict block. If an ordinary user
+            # message is handled while stale one-shot state is still active (or
+            # a slice ends without the required block), do not fall through to
+            # the fail-open auxiliary judge: that would classify errors or
+            # unrelated replies as CONTINUE and restart /goal_prompt_oneshot on
+            # the next arbitrary message.
+            if parse_oneshot_continuation_decision(final_response or "") is None:
+                try:
+                    state.status = "paused"
+                    state.last_verdict = "skipped"
+                    state.last_reason = "missing /goal_prompt_oneshot continuation verdict"
+                    state.paused_reason = "missing /goal_prompt_oneshot continuation verdict"
+                    save_goal(sid, state)
+                except Exception as exc:
+                    logger.debug("goal oneshot missing-verdict pause failed: %s", exc)
+                return
+
         decision = mgr.evaluate_after_turn(final_response or "", user_initiated=True)
+        state = getattr(mgr, "state", None)
         msg = decision.get("message") or ""
+        if decision.get("should_continue") and getattr(state, "goal_mode", "") != "goal_prompt_oneshot":
+            # Regular /goal and /goal_prompt loops should continue silently in
+            # gateway chats.  The visible controller-style progress banner is
+            # reserved for /goal_prompt_oneshot, where the operator expects
+            # deterministic continuation notices between autonomous slices.
+            msg = ""
 
         # Defer the status line until after the adapter has delivered the
         # agent's visible final response. The judge runs after the response is
@@ -10944,10 +11350,42 @@ class GatewayRunner:
         # an awaited post-delivery callback preserves delivery reliability
         # without reversing the user-visible ordering.
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            if response_already_delivered:
+                await self._send_goal_status_notice(source, msg)
+            else:
+                await self._defer_goal_status_notice_after_delivery(source, msg)
 
         if not decision.get("should_continue"):
             return
+
+        if self._maybe_refresh_oneshot_goal_after_compactions_gateway(
+            mgr=mgr, session_entry=session_entry, source=source
+        ):
+            return
+
+        state = getattr(mgr, "state", None)
+        if (
+            state is not None
+            and getattr(state, "goal_mode", "") == "goal_prompt_oneshot"
+            and getattr(state, "goal_prompt_path", "")
+            and source is not None
+        ):
+            try:
+                adapter = self.adapters.get(source.platform)
+                session_key = self._session_key_for_source(source)
+                if adapter and session_key:
+                    reload_event = MessageEvent(
+                        text=f"/goal_prompt_oneshot {state.goal_prompt_path}",
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        message_id=getattr(source, "message_id", None),
+                        channel_prompt=None,
+                        internal=True,
+                    )
+                    self._enqueue_fifo(session_key, reload_event, adapter)
+                    return
+            except Exception as exc:
+                logger.debug("goal oneshot reload enqueue failed: %s", exc)
 
         prompt = decision.get("continuation_prompt") or ""
         if not prompt or source is None:
@@ -16520,13 +16958,32 @@ class GatewayRunner:
             _plat_streaming = resolve_display_setting(
                 user_config, platform_key, "streaming"
             )
-            # None = no per-platform override → follow global config
+            # None = no per-platform override → follow global config.  This
+            # switch controls provider/API streaming so tool-call generation can
+            # surface promptly; final assistant prose is gated separately below.
             _streaming_enabled = (
                 _scfg.enabled and _scfg.transport != "off"
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
-            _want_stream_deltas = _streaming_enabled
+            _final_response_streaming = bool(
+                resolve_display_setting(
+                    user_config,
+                    platform_key,
+                    "final_response_streaming",
+                    False,
+                )
+            )
+            # Keep the provider stream active when requested so tool-call
+            # generation/progress remains visible, but default gateway final
+            # replies to the normal paginated send path.  Chat platforms are
+            # sensitive to edited/streamed final prose: it can bypass the
+            # adapter's page delivery boundary and make /goal_prompt_oneshot
+            # continuation callbacks race or appear to stop after a loading
+            # block.  Users who really want token-by-token final prose can opt
+            # back in with display[.platforms.<platform>].final_response_streaming.
+            _want_stream_deltas = _streaming_enabled and _final_response_streaming
+            _want_tool_call_streaming = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
@@ -16683,7 +17140,18 @@ class GatewayRunner:
             # turn and must not be baked into the cached agent constructor.
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
-            agent.stream_delta_callback = _stream_delta_cb
+            if _want_stream_deltas:
+                agent.stream_delta_callback = _stream_delta_cb
+            elif _want_tool_call_streaming:
+                def _tool_call_stream_probe_only(_text: str) -> bool:
+                    # Keep provider streaming enabled for early tool-call
+                    # generation callbacks, but return False so AIAgent does
+                    # not record the assistant prose as user-delivered.
+                    return False
+
+                agent.stream_delta_callback = _tool_call_stream_probe_only
+            else:
+                agent.stream_delta_callback = None
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
@@ -17188,13 +17656,19 @@ class GatewayRunner:
             _session_was_split = False
             if agent and session_key and hasattr(agent, 'session_id') and agent.session_id != session_id:
                 _session_was_split = True
+                new_session_id = getattr(agent, 'session_id', '')
                 logger.info(
                     "Session split detected: %s → %s (compression)",
-                    session_id, agent.session_id,
+                    session_id, new_session_id,
+                )
+                self._carry_goal_state_between_sessions(
+                    session_id,
+                    new_session_id,
+                    reason="compression",
                 )
                 entry = self.session_store._entries.get(session_key)
                 if entry:
-                    entry.session_id = agent.session_id
+                    entry.session_id = new_session_id
                     self.session_store._save()
 
                 # If this is a Telegram DM and source.thread_id was lost during

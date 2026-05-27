@@ -104,6 +104,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<prompt>"),
     CommandDef("goal", "Set a standing goal Hermes works on across turns until achieved", "Session",
                args_hint="[text | pause | resume | clear | status]"),
+    CommandDef("goal-prompt", "Set /goal from docs/runbooks/GOAL_PROMPT.md", "Session",
+               aliases=("goal_prompt",), args_hint="[path]"),
+    CommandDef("goal-prompt-oneshot", "Set high-autonomy chained /goal from GOAL_PROMPT.md", "Session",
+               aliases=("goal_prompt_oneshot",), args_hint="[path]"),
     CommandDef("subgoal", "Add or manage extra criteria on the active goal", "Session",
                args_hint="[text | remove N | clear]"),
     CommandDef("status", "Show session info", "Session"),
@@ -1074,7 +1078,16 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
             continue
         _add(cmd.name, cmd.description, cmd.args_hint or "")
 
-    # Second pass: aliases.
+    # Second pass: high-value aliases that should survive the 50-command cap.
+    priority_aliases = {"reset", "q", "bg", "btw", "tasks"}
+    for cmd in COMMAND_REGISTRY:
+        if not _is_gateway_available(cmd, overrides):
+            continue
+        for alias in cmd.aliases:
+            if alias in priority_aliases:
+                _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+
+    # Third pass: remaining aliases.
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
@@ -1083,7 +1096,7 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
             # normalization (already covered by _add dedup).
             _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
 
-    # Third pass: plugin commands.
+    # Fourth pass: plugin commands.
     for name, description, args_hint in _iter_plugin_command_entries():
         _add(name, description, args_hint or "")
 

@@ -2,6 +2,12 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## Goal Prompt Restart Contract
+
+Auto-Continue Rule: when running under `/goal_prompt_oneshot`, Keep working until the current `GOAL.md` Definition of Done is satisfied, a true Hard Stop is reached, or the latest operator instruction explicitly requests an operational stop such as a Hermes restart checkpoint.
+
+Do not stop after an ordinary `CONTINUE` verdict when safe local work remains. For the current restart checkpoint, do stop before starting another slice because the latest operator instruction requested a graceful Hermes restart. Hard Stops include credential exposure, destructive git history operations, production/external side effects, push/publication without explicit approval, and any live/funded action.
+
 ## Development Environment
 
 ```bash

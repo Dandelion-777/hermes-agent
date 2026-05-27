@@ -763,6 +763,9 @@ class _CodexCompletionsAdapter:
             if converted:
                 resp_kwargs["tools"] = converted
 
+        from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+        resp_kwargs = _preflight_codex_api_kwargs(resp_kwargs, allow_stream=False)
+
         # Stream and collect the response
         text_parts: List[str] = []
         tool_calls_raw: List[Any] = []

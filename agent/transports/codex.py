@@ -101,9 +101,10 @@ class ResponsesApiTransport(ProviderTransport):
                 payload_messages,
                 is_xai_responses=is_xai_responses,
             ),
-            "tools": response_tools,
             "store": False,
         }
+        if response_tools is not None:
+            kwargs["tools"] = response_tools
         if response_tools:
             kwargs["tool_choice"] = "auto"
             kwargs["parallel_tool_calls"] = True
