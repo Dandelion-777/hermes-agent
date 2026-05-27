@@ -182,6 +182,7 @@ def workflow_check(repo: Path) -> CheckResult:
                 "send_document",
                 "caption=None",
                 "_enqueue_goal_kickoff_event",
+                "_hermes_goal_prompt_oneshot",
                 "missing /goal_prompt_oneshot continuation verdict",
                 "internal=False",
             ],
@@ -202,6 +203,19 @@ def workflow_check(repo: Path) -> CheckResult:
         ) and contains_all(
             read_text(repo, "tests/hermes_cli/test_goal_prompt.py"),
             ["goal_prompt", "oneshot"],
+        ) and contains_all(
+            read_text(repo, "tests/gateway/test_goal_prompt_command.py"),
+            [
+                "post_delivery_sends_docs_before_kickoff",
+                '("doc", "GOAL_PROMPT.md", None',
+                '("doc", "GOAL.md", None',
+                "registered_generation",
+                "plain_message_does_not_restart_without_verdict",
+                "continue_requeues_visible_prompt_loader",
+                "reload_returns_notice_and_queues",
+                "pause_clears_stale_oneshot_loader_when_no_goal_state",
+                "pause_clears_stale_oneshot_post_delivery_callback_without_goal_state",
+            ],
         ),
     ))
 

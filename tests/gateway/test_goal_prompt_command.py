@@ -381,3 +381,95 @@ async def test_gateway_goal_prompt_oneshot_plain_message_does_not_restart_withou
     assert state.status == "paused"
     assert state.paused_reason == "missing /goal_prompt_oneshot continuation verdict"
     goals._DB_CACHE.clear()
+
+@pytest.mark.asyncio
+async def test_gateway_goal_pause_clears_stale_oneshot_loader_when_no_goal_state(tmp_path: Path, monkeypatch):
+    """A stale queued one-shot reload must not survive a later /goal pause.
+
+    Users can observe "No active goal" when durable goal state already moved or
+    was cleared, while the adapter still has a queued /goal_prompt_oneshot reload
+    in the session slot.  The pause command must clear that synthetic controller
+    event anyway so the next unrelated message cannot kick off another slice.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import goals
+    goals._DB_CACHE.clear()
+
+    prompt = tmp_path / "docs" / "runbooks" / "GOAL_PROMPT.md"
+    prompt.parent.mkdir(parents=True)
+    prompt.write_text("```text\n/goal Continue project\n```", encoding="utf-8")
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = {"goals": {"oneshot_max_turns": 250, "oneshot_compaction_refresh_interval": 5}}
+    runner.session_store = SimpleNamespace(
+        get_or_create_session=lambda _source: SimpleNamespace(session_id="sid-no-active-goal")
+    )
+
+    class FakeAdapter:
+        def __init__(self):
+            self._pending_messages = {
+                "session-key": MessageEvent(
+                    text=f"/goal_prompt_oneshot {prompt}",
+                    message_type=MessageType.TEXT,
+                    source=SimpleNamespace(platform="telegram", chat_id="123"),
+                )
+            }
+
+    adapter = FakeAdapter()
+    runner.adapters = {"telegram": adapter}
+    runner._session_key_for_source = lambda _source: "session-key"
+
+    event = MessageEvent(
+        text="/goal pause",
+        message_type=MessageType.TEXT,
+        source=SimpleNamespace(platform="telegram", chat_id="123"),
+    )
+
+    result = await runner._handle_goal_command(event)
+
+    assert "No active goal" in result or "No goal" in result
+    assert adapter._pending_messages == {}
+    goals._DB_CACHE.clear()
+
+@pytest.mark.asyncio
+async def test_gateway_goal_pause_clears_stale_oneshot_post_delivery_callback_without_goal_state(tmp_path: Path, monkeypatch):
+    """A no-goal /goal pause must also remove stale one-shot doc/kickoff callbacks."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import goals
+    goals._DB_CACHE.clear()
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = {"goals": {"oneshot_max_turns": 250, "oneshot_compaction_refresh_interval": 5}}
+    runner.session_store = SimpleNamespace(
+        get_or_create_session=lambda _source: SimpleNamespace(session_id="sid-no-active-goal-callback")
+    )
+
+    def stale_goal_callback():
+        raise AssertionError("stale callback should have been cleared")
+
+    stale_goal_callback._hermes_goal_prompt_oneshot = True
+
+    class FakeAdapter:
+        def __init__(self):
+            self._pending_messages = {}
+            self._post_delivery_callbacks = {"session-key": (17, stale_goal_callback)}
+
+    adapter = FakeAdapter()
+    runner.adapters = {"telegram": adapter}
+    runner._session_key_for_source = lambda _source: "session-key"
+
+    event = MessageEvent(
+        text="/goal pause",
+        message_type=MessageType.TEXT,
+        source=SimpleNamespace(platform="telegram", chat_id="123"),
+    )
+
+    result = await runner._handle_goal_command(event)
+
+    assert "No active goal" in result or "No goal" in result
+    assert adapter._post_delivery_callbacks == {}
+    goals._DB_CACHE.clear()

@@ -2666,6 +2666,14 @@ class GatewayRunner:
                     queued_events[session_key] = kept
                 else:
                     queued_events.pop(session_key, None)
+
+        callbacks = getattr(adapter, "_post_delivery_callbacks", None) if adapter is not None else None
+        if isinstance(callbacks, dict):
+            entry = callbacks.get(session_key)
+            callback = entry[1] if isinstance(entry, tuple) and len(entry) == 2 else entry
+            if getattr(callback, "_hermes_goal_prompt_oneshot", False):
+                callbacks.pop(session_key, None)
+                removed += 1
         return removed
 
     def _goal_still_active_for_session(self, session_id: str) -> bool:
@@ -10949,6 +10957,7 @@ class GatewayRunner:
             self._enqueue_goal_kickoff_event(event, goal_text)
 
         try:
+            setattr(_after_loading_notice, "_hermes_goal_prompt_oneshot", True)
             generation = None
             active = getattr(adapter, "_active_sessions", {}).get(session_key)
             if active is not None:
@@ -10984,9 +10993,6 @@ class GatewayRunner:
             return mgr.status_line()
 
         if lower == "pause":
-            state = mgr.pause(reason="user-paused")
-            if state is None:
-                return t("gateway.goal.no_goal_set")
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
@@ -10994,6 +11000,9 @@ class GatewayRunner:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
             except Exception as exc:
                 logger.debug("goal pause: pending continuation cleanup failed: %s", exc)
+            state = mgr.pause(reason="user-paused")
+            if state is None:
+                return t("gateway.goal.no_goal_set")
             return t("gateway.goal.paused", goal=state.goal)
 
         if lower == "resume":
