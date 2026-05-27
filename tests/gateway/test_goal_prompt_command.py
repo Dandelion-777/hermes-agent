@@ -473,3 +473,60 @@ async def test_gateway_goal_pause_clears_stale_oneshot_post_delivery_callback_wi
     assert "No active goal" in result or "No goal" in result
     assert adapter._post_delivery_callbacks == {}
     goals._DB_CACHE.clear()
+
+@pytest.mark.asyncio
+async def test_gateway_goal_status_clears_stale_oneshot_post_delivery_callback(tmp_path: Path, monkeypatch):
+    """/goal status must be native and must not flush stale one-shot docs/kickoff callbacks."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import goals
+    goals._DB_CACHE.clear()
+
+    session_id = "sid-status-stale-callback"
+    goals.GoalManager(session_id, default_max_turns=250).set(
+        "Continue project",
+        goal_mode="goal_prompt_oneshot",
+        goal_prompt_path=str(tmp_path / "docs" / "runbooks" / "GOAL_PROMPT.md"),
+        compaction_refresh_interval=5,
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = {"goals": {"oneshot_max_turns": 250, "oneshot_compaction_refresh_interval": 5}}
+    runner.session_store = SimpleNamespace(
+        get_or_create_session=lambda _source: SimpleNamespace(session_id=session_id)
+    )
+
+    def stale_goal_callback():
+        raise AssertionError("stale callback should have been cleared")
+
+    stale_goal_callback._hermes_goal_prompt_oneshot = True
+
+    class FakeAdapter:
+        def __init__(self):
+            self._pending_messages = {}
+            self._post_delivery_callbacks = {"session-key": (17, stale_goal_callback)}
+
+    adapter = FakeAdapter()
+    runner.adapters = {"telegram": adapter}
+    runner._session_key_for_source = lambda _source: "session-key"
+
+    event = MessageEvent(
+        text="/goal status",
+        message_type=MessageType.TEXT,
+        source=SimpleNamespace(platform="telegram", chat_id="123"),
+    )
+
+    result = await runner._handle_goal_command(event)
+
+    assert "Goal" in result
+    assert "GOAL_PROMPT" not in result
+    assert adapter._post_delivery_callbacks == {}
+    goals._DB_CACHE.clear()
+
+
+def test_goal_continuation_event_recognizes_bare_oneshot_loader():
+    runner = object.__new__(GatewayRunner)
+
+    assert runner._is_goal_continuation_event("/goal_prompt_oneshot") is True
+    assert runner._is_goal_continuation_event("/goal_prompt_oneshot /tmp/project") is True

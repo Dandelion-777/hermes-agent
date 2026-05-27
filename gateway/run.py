@@ -2631,10 +2631,12 @@ class GatewayRunner:
         suppressing them.
         """
         text = getattr(event_or_text, "text", event_or_text) or ""
+        text = str(text)
         return (
-            str(text).startswith("[Continuing toward your standing goal]\nGoal:")
-            or str(text).startswith("[Continuing /goal_prompt_oneshot from disk frontier]\nGoal:")
-            or str(text).startswith("/goal_prompt_oneshot ")
+            text.startswith("[Continuing toward your standing goal]\nGoal:")
+            or text.startswith("[Continuing /goal_prompt_oneshot from disk frontier]\nGoal:")
+            or text == "/goal_prompt_oneshot"
+            or text.startswith("/goal_prompt_oneshot ")
         )
 
     def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
@@ -10990,6 +10992,13 @@ class GatewayRunner:
             return t("gateway.goal.unavailable")
 
         if not args or lower == "status":
+            try:
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                if adapter and _quick_key:
+                    self._clear_goal_pending_continuations(_quick_key, adapter)
+            except Exception as exc:
+                logger.debug("goal status: pending continuation cleanup failed: %s", exc)
             return mgr.status_line()
 
         if lower == "pause":
