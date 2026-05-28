@@ -14,13 +14,13 @@ Read these files first:
 
 Source priority:
 1. Latest explicit operator instruction in the active session.
-2. docs/status/NEXT_ACTIONS.md for volatile frontier and restart state.
+2. docs/status/NEXT_ACTIONS.md for volatile frontier and stop/resume state.
 3. docs/security/SAFETY.md and AGENTS.md for safety and repo policy.
 4. GOAL.md for standing Definition of Done.
 5. Other repository docs and code.
 
-Current restart boundary:
-- If this prompt is being loaded after the operator-requested Hermes restart, first verify the checkpoint state against git status and NEXT_ACTIONS.md.
+Current stop/resume boundary:
+- If this prompt is being loaded after the operator-requested graceful stop, first verify the checkpoint state against git status and NEXT_ACTIONS.md.
 - Do not push unless the operator explicitly authorizes publication.
 - Continue only local safe source/docs/tests work. No secrets, production deploys, destructive git history operations, or external side effects.
 
@@ -58,6 +58,6 @@ GOAL.md definition of done: SATISFIED
 Evidence: <tests/docs/git status/commit evidence>
 ```
 
-## Current Recommended First Slice After Restart
+## Current Recommended First Slice After Resume
 
-Run `/goal_prompt_oneshot /home/shvdxw/.hermes/hermes-agent` after Hermes restarts. The first action is to re-read disk truth, inspect `git status --short --branch`, and continue the next safe local verification/cleanup slice from `docs/status/NEXT_ACTIONS.md` without pushing unless separately authorized.
+Run `/goal_prompt_oneshot /home/shvdxw/.hermes/hermes-agent` when the operator is ready to resume. The first action is to re-read disk truth, inspect `git status --short --branch`, run the minimum post-stop checks in `docs/status/NEXT_ACTIONS.md`, and continue the next safe local verification/cleanup slice without pushing unless separately authorized.
