@@ -121,7 +121,7 @@ def workflow_check(repo: Path) -> CheckResult:
         ),
     ))
     checks.append((
-        "GoalState oneshot metadata and deterministic verdict parsing",
+        "GoalState oneshot metadata, deterministic verdict parsing, and slice judge gate",
         contains_all(
             read_text(repo, "hermes_cli/goals.py"),
             [
@@ -130,6 +130,16 @@ def workflow_check(repo: Path) -> CheckResult:
                 "ONESHOT_CONTINUATION_PROMPT_TEMPLATE",
                 "Judge reasoning",
                 "_oneshot_judge_verdict_summary",
+                "ONESHOT_SLICE_JUDGE_SYSTEM_PROMPT",
+                "judge_goal_slice",
+                "goal_slice_judge",
+                "pass_continue",
+                "pass_complete",
+            ],
+        ) and contains_all(
+            read_text(repo, "gateway/run.py"),
+            [
+                'decision.get("oneshot_repair")',
             ],
         ),
     ))
@@ -179,7 +189,14 @@ def workflow_check(repo: Path) -> CheckResult:
         "focused regression tests present",
         contains_all(
             read_text(repo, "tests/hermes_cli/test_goals.py"),
-            ["test_oneshot_continue_status_line", "STOP_FOR_OPERATOR", "Judge reasoning"],
+            [
+                "test_oneshot_continue_status_line",
+                "test_oneshot_continue_sentinel_uses_slice_judge_before_advancing",
+                "test_judge_goal_slice_uses_goal_slice_judge_auxiliary_task",
+                "test_oneshot_slice_judge_repair_queues_repair_prompt_not_next_slice",
+                "STOP_FOR_OPERATOR",
+                "Judge reasoning",
+            ],
         ) and contains_all(
             read_text(repo, "tests/hermes_cli/test_goal_prompt.py"),
             ["goal_prompt", "oneshot"],
@@ -299,11 +316,11 @@ def self_test() -> None:
         assert not workflow_check(root).complete
         (root / "hermes_cli/goal_prompt.py").write_text("resolve_goal_prompt_path extract_goal_prompt_text GOAL_PROMPT.md Judge reasoning:", encoding="utf-8")
         (root / "hermes_cli/commands.py").write_text("goal_prompt goal-prompt goal_prompt_oneshot goal-prompt-oneshot", encoding="utf-8")
-        (root / "hermes_cli/goals.py").write_text("goal_prompt_oneshot parse_oneshot_continuation_decision ONESHOT_CONTINUATION_PROMPT_TEMPLATE Judge reasoning _oneshot_judge_verdict_summary", encoding="utf-8")
+        (root / "hermes_cli/goals.py").write_text("goal_prompt_oneshot parse_oneshot_continuation_decision ONESHOT_CONTINUATION_PROMPT_TEMPLATE Judge reasoning _oneshot_judge_verdict_summary ONESHOT_SLICE_JUDGE_SYSTEM_PROMPT judge_goal_slice goal_slice_judge pass_continue pass_complete", encoding="utf-8")
         (root / "cli.py").write_text("_handle_goal_prompt_command goal-prompt-oneshot _maybe_refresh_oneshot_goal_after_compactions", encoding="utf-8")
-        (root / "gateway/run.py").write_text("_handle_goal_prompt_command goal-prompt-oneshot _maybe_refresh_oneshot_goal_after_compactions goal_prompt_document_paths _send_goal_prompt_documents _register_goal_prompt_oneshot_post_delivery register_post_delivery_callback generation=generation send_document caption=None _enqueue_goal_kickoff_event _hermes_goal_prompt_oneshot missing /goal_prompt_oneshot continuation verdict context compactions; goal oneshot compaction refresh notice failed internal=False", encoding="utf-8")
+        (root / "gateway/run.py").write_text("_handle_goal_prompt_command goal-prompt-oneshot _maybe_refresh_oneshot_goal_after_compactions goal_prompt_document_paths _send_goal_prompt_documents _register_goal_prompt_oneshot_post_delivery register_post_delivery_callback generation=generation send_document caption=None _enqueue_goal_kickoff_event _hermes_goal_prompt_oneshot missing /goal_prompt_oneshot continuation verdict context compactions; goal oneshot compaction refresh notice failed internal=False decision.get(\"oneshot_repair\")", encoding="utf-8")
         (root / "tui_gateway/server.py").write_text("goal_prompt_oneshot resolve_goal_prompt_path command_name = \"/goal_prompt_oneshot\"", encoding="utf-8")
-        (root / "tests/hermes_cli/test_goals.py").write_text("test_oneshot_continue_status_line STOP_FOR_OPERATOR Judge reasoning", encoding="utf-8")
+        (root / "tests/hermes_cli/test_goals.py").write_text("test_oneshot_continue_status_line test_oneshot_continue_sentinel_uses_slice_judge_before_advancing test_judge_goal_slice_uses_goal_slice_judge_auxiliary_task test_oneshot_slice_judge_repair_queues_repair_prompt_not_next_slice STOP_FOR_OPERATOR Judge reasoning", encoding="utf-8")
         (root / "tests/hermes_cli/test_goal_prompt.py").write_text("goal_prompt oneshot", encoding="utf-8")
         (root / "tests/gateway/test_goal_prompt_command.py").write_text("post_delivery_sends_docs_before_kickoff (\"doc\", \"GOAL_PROMPT.md\", None (\"doc\", \"GOAL.md\", None registered_generation plain_message_does_not_restart_without_verdict continue_requeues_visible_prompt_loader compaction_refresh_sends_visible_notice_before_reload reload_returns_notice_and_queues pause_clears_stale_oneshot_loader_when_no_goal_state pause_clears_stale_oneshot_post_delivery_callback_without_goal_state status_clears_stale_oneshot_post_delivery_callback goal_continuation_event_recognizes_bare_oneshot_loader", encoding="utf-8")
         (root / "tests/gateway/test_goal_verdict_send.py").write_text("test_goal_verdict_continue_enqueues_continuation_without_regular_goal_banner test_goal_verdict_continue_runs_for_already_sent_streamed_response", encoding="utf-8")
