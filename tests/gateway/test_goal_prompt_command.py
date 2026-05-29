@@ -1,6 +1,7 @@
 import types
 from types import SimpleNamespace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -168,18 +169,19 @@ async def test_gateway_goal_prompt_oneshot_continue_requeues_visible_prompt_load
 
     runner._enqueue_fifo = fake_enqueue
 
-    await runner._post_turn_goal_continuation(
-        session_entry=SimpleNamespace(session_id="sid-requeue"),
-        source=SimpleNamespace(platform="telegram", chat_id="123", message_id="msg-1"),
-        final_response=(
-            "Judge reasoning: GOAL.md is not satisfied and safe work remains\n"
-            "/goal_prompt_oneshot continuation decision: CONTINUE\n"
-            "GOAL.md definition of done: NOT SATISFIED\n"
-            "Next safe autonomous slice: next slice\n"
-            "Operator input needed before next slice: None\n"
-            "Hard stop: No"
-        ),
-    )
+    with patch.object(goals, "judge_goal_slice", return_value=("pass_continue", "slice verified", False, "")):
+        await runner._post_turn_goal_continuation(
+            session_entry=SimpleNamespace(session_id="sid-requeue"),
+            source=SimpleNamespace(platform="telegram", chat_id="123", message_id="msg-1"),
+            final_response=(
+                "Judge reasoning: GOAL.md is not satisfied and safe work remains\n"
+                "/goal_prompt_oneshot continuation decision: CONTINUE\n"
+                "GOAL.md definition of done: NOT SATISFIED\n"
+                "Next safe autonomous slice: next slice\n"
+                "Operator input needed before next slice: None\n"
+                "Hard stop: No"
+            ),
+        )
 
     assert notices
     assert "judge: GOAL.md is not satisfied and safe work remains" in notices[0]
