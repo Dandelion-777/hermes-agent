@@ -11397,6 +11397,7 @@ class GatewayRunner:
             and getattr(state, "goal_mode", "") == "goal_prompt_oneshot"
             and getattr(state, "goal_prompt_path", "")
             and source is not None
+            and not decision.get("oneshot_repair")
         ):
             try:
                 adapter = self.adapters.get(source.platform)

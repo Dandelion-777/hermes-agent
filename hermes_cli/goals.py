@@ -141,6 +141,50 @@ ONESHOT_JUDGE_SYSTEM_PROMPT = (
 )
 
 
+ONESHOT_SLICE_JUDGE_SYSTEM_PROMPT = (
+    "You are the independent slice-quality judge for a Hermes "
+    "/goal_prompt_oneshot loop. Codex already completed one slice and emitted "
+    "a deterministic CONTINUE, COMPLETE, or STOP_FOR_OPERATOR block. Your job "
+    "is to decide whether that verdict is justified by the response evidence.\n\n"
+    "Return pass_continue only when the response gives concrete verification "
+    "evidence, refreshes the frontier, says GOAL.md is not satisfied, reports "
+    "no hard failure, and names a safe next autonomous slice.\n"
+    "Return pass_complete only when the response gives concrete evidence that "
+    "GOAL.md's Definition of Done is satisfied and no hard failure is active.\n"
+    "Return repair when the slice is incomplete, evidence is vague, docs/frontier "
+    "look stale or ambiguous, verification is missing, or the next action is not "
+    "specific enough.\n"
+    "Return stop_for_operator only when the response proves a true non-bypassable "
+    "operator gate and no safe local/mock/simulation/dry-run/report-only/docs/test "
+    "slice remains.\n\n"
+    "Reply ONLY with a single JSON object on one line:\n"
+    '{\"verdict\": \"pass_continue|pass_complete|repair|stop_for_operator\", '
+    '\"reason\": \"<one-sentence rationale>\", '
+    '\"repair_prompt\": \"<focused repair instruction when verdict is repair, else empty>\"}'
+)
+
+
+ONESHOT_SLICE_JUDGE_USER_PROMPT_TEMPLATE = (
+    "Goal:\n{goal}\n\n"
+    "Codex proposed verdict: {proposed_verdict}\n\n"
+    "Codex slice response:\n{response}\n\n"
+    "Current time: {current_time}\n\n"
+    "Evaluate whether the proposed verdict is correct and whether this slice is "
+    "complete enough to advance."
+)
+
+
+ONESHOT_REPAIR_PROMPT_TEMPLATE = (
+    "[Repair the last /goal_prompt_oneshot slice after slice-judge review]\n"
+    "Goal: {goal}\n\n"
+    "Slice judge reason: {reason}\n"
+    "Repair instruction: {repair_prompt}\n\n"
+    "Repair only the just-completed slice. Re-read disk truth and the project "
+    "frontier docs before acting. Do not start a new frontier slice until the "
+    "repair is verified. End with the required /goal_prompt_oneshot verdict block."
+)
+
+
 JUDGE_USER_PROMPT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Agent's most recent response:\n{response}\n\n"
@@ -379,6 +423,63 @@ def _goal_judge_max_tokens() -> int:
     return DEFAULT_JUDGE_MAX_TOKENS
 
 
+def _auxiliary_task_max_tokens(task_name: str) -> int:
+    """Resolve auxiliary.<task>.max_tokens with the goal judge default."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        value = (
+            (cfg.get("auxiliary") or {})
+            .get(task_name, {})
+            .get("max_tokens", DEFAULT_JUDGE_MAX_TOKENS)
+        )
+        value = int(value)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return DEFAULT_JUDGE_MAX_TOKENS
+
+
+def _oneshot_slice_judge_enabled() -> bool:
+    """Return whether accepted /goal_prompt_oneshot verdicts need slice review."""
+    try:
+        from hermes_cli.config import load_config
+
+        goals_cfg = (load_config().get("goals") or {})
+        value = goals_cfg.get("oneshot_slice_judge", True)
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(value)
+    except Exception:
+        return True
+
+
+def _oneshot_slice_judge_failure_mode() -> str:
+    """Return fail-closed behavior when the slice judge cannot produce JSON."""
+    try:
+        from hermes_cli.config import load_config
+
+        goals_cfg = (load_config().get("goals") or {})
+        value = str(goals_cfg.get("oneshot_slice_judge_failure") or "repair")
+    except Exception:
+        value = "repair"
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"stop", "stop_for_operator", "operator_required", "pause"}:
+        return "stop_for_operator"
+    return "repair"
+
+
+def _repair_prompt_for_slice_judge(goal: str, reason: str, repair_prompt: str) -> str:
+    prompt = (repair_prompt or "Repair the previous slice until evidence and frontier docs are sufficient.").strip()
+    return ONESHOT_REPAIR_PROMPT_TEMPLATE.format(
+        goal=goal,
+        reason=(reason or "slice judge requested repair").strip(),
+        repair_prompt=prompt,
+    )
+
+
 def _parse_judge_response(raw: str) -> Tuple[bool, str, bool]:
     """Parse the judge's reply. Fail-open to ``(False, "<reason>", parse_failed)``.
 
@@ -486,6 +587,8 @@ def _oneshot_continue_status_reason(last_response: str, verdict: str, reason: st
     done_line = _oneshot_done_line(last_response)
     next_action = _line_value(last_response, "Next safe autonomous slice") or reason
     parts = [_oneshot_judge_verdict_summary(last_response, verdict, reason)]
+    if reason.startswith("slice judge:"):
+        parts.append(reason)
     if done_line:
         parts.append(f"GOAL.md definition of done: {done_line}")
     if next_action:
@@ -549,6 +652,126 @@ def parse_oneshot_continuation_decision(last_response: str) -> Optional[Tuple[st
     if goal_unsatisfied and safe_next and not hard_stop:
         return "continue", "GOAL.md is not satisfied and a safe next action remains"
     return None
+
+
+def _parse_slice_judge_response(raw: str) -> Tuple[str, str, bool, str]:
+    """Parse slice judge JSON. Returns (verdict, reason, parse_failed, repair_prompt)."""
+    if not raw:
+        return "repair", "slice judge returned empty response", True, "Re-run and repair the just-completed slice with concrete evidence."
+
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        nl = text.find("\n")
+        if nl != -1:
+            text = text[nl + 1:]
+
+    data: Optional[Dict[str, Any]] = None
+    try:
+        data = json.loads(text)
+    except Exception:
+        match = _JSON_OBJECT_RE.search(text)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except Exception:
+                data = None
+
+    if not isinstance(data, dict):
+        return "repair", f"slice judge reply was not JSON: {_truncate(raw, 200)!r}", True, "Repair the previous slice and provide concrete verification evidence."
+
+    verdict = str(data.get("verdict") or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "continue": "pass_continue",
+        "pass": "pass_continue",
+        "done": "pass_complete",
+        "complete": "pass_complete",
+        "stop": "stop_for_operator",
+        "operator_required": "stop_for_operator",
+    }
+    verdict = aliases.get(verdict, verdict)
+    if verdict not in {"pass_continue", "pass_complete", "repair", "stop_for_operator"}:
+        return "repair", f"slice judge returned invalid verdict: {verdict or '<empty>'}", True, "Repair the previous slice and return a valid verdict block."
+
+    reason = str(data.get("reason") or "").strip() or "no reason provided"
+    repair_prompt = str(data.get("repair_prompt") or "").strip()
+    return verdict, reason, False, repair_prompt
+
+
+def judge_goal_slice(
+    goal: str,
+    last_response: str,
+    *,
+    proposed_verdict: str,
+    timeout: float = DEFAULT_JUDGE_TIMEOUT,
+) -> Tuple[str, str, bool, str]:
+    """Independently review a /goal_prompt_oneshot slice verdict.
+
+    Returns ``(verdict, reason, parse_failed, repair_prompt)``. Verdict is one
+    of ``pass_continue``, ``pass_complete``, ``repair``, or
+    ``stop_for_operator``. Judge failures fail closed to the configured
+    ``goals.oneshot_slice_judge_failure`` mode (default: repair), never pass.
+    """
+    if not goal.strip():
+        return "repair", "empty goal", False, "Restore the goal and re-evaluate the slice."
+    if not last_response.strip():
+        return "repair", "empty response", False, "Re-run the slice and provide a complete verdict block."
+
+    try:
+        from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
+    except Exception as exc:
+        logger.debug("goal slice judge: auxiliary client import failed: %s", exc)
+        mode = _oneshot_slice_judge_failure_mode()
+        return mode, "auxiliary client unavailable", False, "Repair the slice after the independent judge becomes available."
+
+    try:
+        client, model = get_text_auxiliary_client("goal_slice_judge")
+    except Exception as exc:
+        logger.debug("goal slice judge: get_text_auxiliary_client failed: %s", exc)
+        mode = _oneshot_slice_judge_failure_mode()
+        return mode, "auxiliary client unavailable", False, "Repair the slice after the independent judge becomes available."
+
+    if client is None or not model:
+        mode = _oneshot_slice_judge_failure_mode()
+        return mode, "no slice judge auxiliary client configured", False, "Configure auxiliary.goal_slice_judge, then repair the slice."
+
+    current_time = datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    prompt = ONESHOT_SLICE_JUDGE_USER_PROMPT_TEMPLATE.format(
+        goal=_truncate(goal, 3000),
+        proposed_verdict=(proposed_verdict or "").strip(),
+        response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+        current_time=current_time,
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": ONESHOT_SLICE_JUDGE_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=_auxiliary_task_max_tokens("goal_slice_judge"),
+            timeout=timeout,
+            extra_body=get_auxiliary_extra_body() or None,
+        )
+    except Exception as exc:
+        logger.info("goal slice judge: API call failed (%s) — failing closed", exc)
+        mode = _oneshot_slice_judge_failure_mode()
+        return mode, f"slice judge error: {type(exc).__name__}", False, "Repair the slice or fix auxiliary.goal_slice_judge before advancing."
+
+    try:
+        raw = resp.choices[0].message.content or ""
+    except Exception:
+        raw = ""
+
+    verdict, reason, parse_failed, repair_prompt = _parse_slice_judge_response(raw)
+    if parse_failed:
+        mode = _oneshot_slice_judge_failure_mode()
+        if mode != "repair":
+            verdict = mode
+    logger.info("goal slice judge: verdict=%s reason=%s", verdict, _truncate(reason, 120))
+    return verdict, reason, parse_failed, repair_prompt
 
 
 def judge_goal(
@@ -852,8 +1075,39 @@ class GoalManager:
         if state.goal_mode == "goal_prompt_oneshot":
             deterministic = parse_oneshot_continuation_decision(last_response)
 
+        oneshot_slice_repair_prompt = ""
+        oneshot_slice_repair = False
         if deterministic is not None:
             verdict, reason = deterministic
+            if (
+                state.goal_mode == "goal_prompt_oneshot"
+                and verdict in {"continue", "done"}
+                and _oneshot_slice_judge_enabled()
+            ):
+                slice_verdict, slice_reason, slice_parse_failed, slice_repair_prompt = judge_goal_slice(
+                    state.goal,
+                    last_response,
+                    proposed_verdict=verdict,
+                )
+                parse_failed = slice_parse_failed
+                if slice_verdict == "pass_continue":
+                    verdict = "continue"
+                    reason = f"slice judge: {slice_reason}"
+                elif slice_verdict == "pass_complete":
+                    verdict = "done"
+                    reason = f"slice judge: {slice_reason}"
+                elif slice_verdict == "stop_for_operator":
+                    verdict = "stop_for_operator"
+                    reason = f"slice judge: {slice_reason}"
+                else:
+                    verdict = "continue"
+                    reason = f"slice judge requested repair: {slice_reason}"
+                    oneshot_slice_repair = True
+                    oneshot_slice_repair_prompt = _repair_prompt_for_slice_judge(
+                        state.goal,
+                        slice_reason,
+                        slice_repair_prompt,
+                    )
         else:
             verdict, reason, parse_failed = judge_goal(
                 state.goal,
@@ -951,18 +1205,26 @@ class GoalManager:
 
         save_goal(self.session_id, state)
         status_reason = reason
+        continuation_prompt = self.next_continuation_prompt()
+        decision_extra: Dict[str, Any] = {}
         if state.goal_mode == "goal_prompt_oneshot" and deterministic is not None:
             status_reason = _oneshot_continue_status_reason(last_response, verdict, reason)
-        return {
+            if oneshot_slice_repair:
+                status_reason = reason
+                continuation_prompt = oneshot_slice_repair_prompt
+                decision_extra["oneshot_repair"] = True
+        decision = {
             "status": "active",
             "should_continue": True,
-            "continuation_prompt": self.next_continuation_prompt(),
+            "continuation_prompt": continuation_prompt,
             "verdict": "continue",
             "reason": reason,
             "message": (
                 f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {status_reason}"
             ),
         }
+        decision.update(decision_extra)
+        return decision
 
     def next_continuation_prompt(self) -> Optional[str]:
         if not self._state or self._state.status != "active":
@@ -992,4 +1254,5 @@ __all__ = [
     "save_goal",
     "clear_goal",
     "judge_goal",
+    "judge_goal_slice",
 ]

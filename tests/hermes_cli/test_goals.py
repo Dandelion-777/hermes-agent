@@ -775,26 +775,96 @@ def test_parse_oneshot_stop_for_operator():
     assert "private key" in reason
 
 
-def test_oneshot_continue_sentinel_skips_llm_judge(hermes_home):
+def test_oneshot_continue_sentinel_uses_slice_judge_before_advancing(hermes_home):
     from hermes_cli import goals
     from hermes_cli.goals import GoalManager
 
     mgr = GoalManager(session_id="oneshot-deterministic", default_max_turns=10)
     mgr.set("continue project", goal_mode="goal_prompt_oneshot")
 
-    with patch.object(goals, "judge_goal") as judge:
-        decision = mgr.evaluate_after_turn(
-            "/goal_prompt_oneshot continuation decision: CONTINUE\n"
-            "GOAL.md definition of done: NOT SATISFIED\n"
-            "Next safe autonomous slice: update the adapter\n"
-            "Operator input needed before next slice: None\n"
-            "Hard stop: No"
-        )
+    response = (
+        "/goal_prompt_oneshot continuation decision: CONTINUE\n"
+        "GOAL.md definition of done: NOT SATISFIED\n"
+        "Next safe autonomous slice: update the adapter\n"
+        "Operator input needed before next slice: None\n"
+        "Hard stop: No"
+    )
+    with patch.object(goals, "judge_goal") as judge, \
+         patch.object(goals, "judge_goal_slice", return_value=("pass_continue", "slice verified", False, "")) as slice_judge:
+        decision = mgr.evaluate_after_turn(response)
 
     judge.assert_not_called()
+    slice_judge.assert_called_once_with("continue project", response, proposed_verdict="continue")
     assert decision["should_continue"] is True
     assert decision["verdict"] == "continue"
     assert "disk frontier" in decision["continuation_prompt"]
+    assert "slice judge: slice verified" in decision["message"]
+
+
+def test_oneshot_slice_judge_repair_queues_repair_prompt_not_next_slice(hermes_home):
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(session_id="oneshot-repair", default_max_turns=10)
+    mgr.set("continue project", goal_mode="goal_prompt_oneshot")
+
+    response = (
+        "Judge reasoning: GOAL.md is not satisfied and safe work remains\n"
+        "/goal_prompt_oneshot continuation decision: CONTINUE\n"
+        "GOAL.md definition of done: NOT SATISFIED\n"
+        "Completed slice: claimed docs refreshed\n"
+        "Next safe autonomous slice: update the adapter\n"
+        "Operator input needed before next slice: None\n"
+        "Hard stop: No"
+    )
+    with patch.object(goals, "judge_goal_slice", return_value=("repair", "docs were stale", False, "Re-read NEXT_ACTIONS.md and repair docs.")):
+        decision = mgr.evaluate_after_turn(response)
+
+    assert decision["should_continue"] is True
+    assert decision["verdict"] == "continue"
+    assert decision.get("oneshot_repair") is True
+    assert "Repair the last /goal_prompt_oneshot slice" in decision["continuation_prompt"]
+    assert "Re-read NEXT_ACTIONS.md and repair docs." in decision["continuation_prompt"]
+    assert "slice judge requested repair" in decision["message"]
+
+
+def test_oneshot_slice_judge_pass_complete_marks_done(hermes_home):
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(session_id="oneshot-pass-complete", default_max_turns=10)
+    mgr.set("continue project", goal_mode="goal_prompt_oneshot")
+    response = (
+        "/goal_prompt_oneshot continuation decision: COMPLETE\n"
+        "GOAL.md definition of done: SATISFIED\n"
+        "Evidence: tests/docs/git status pass"
+    )
+    with patch.object(goals, "judge_goal_slice", return_value=("pass_complete", "DoD verified", False, "")):
+        decision = mgr.evaluate_after_turn(response)
+
+    assert decision["should_continue"] is False
+    assert decision["verdict"] == "done"
+    assert mgr.state.status == "done"
+    assert "DoD verified" in decision["reason"]
+
+
+def test_oneshot_stop_for_operator_does_not_call_slice_judge(hermes_home):
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(session_id="oneshot-stop-no-slice-judge", default_max_turns=10)
+    mgr.set("continue project", goal_mode="goal_prompt_oneshot")
+    with patch.object(goals, "judge_goal_slice") as slice_judge:
+        decision = mgr.evaluate_after_turn(
+            "Judge reasoning: no safe autonomous slice remains\n"
+            "/goal_prompt_oneshot continuation decision: STOP_FOR_OPERATOR\n"
+            "GOAL.md definition of done: NOT SATISFIED\n"
+            "Reason: only production signing remains\n"
+        )
+
+    slice_judge.assert_not_called()
+    assert decision["should_continue"] is False
+    assert decision["verdict"] == "stop_for_operator"
 
 
 def test_oneshot_continue_status_line_shows_judge_reasoning_before_verdict_and_next_action(hermes_home):
@@ -804,7 +874,8 @@ def test_oneshot_continue_status_line_shows_judge_reasoning_before_verdict_and_n
     mgr = GoalManager(session_id="oneshot-status-line", default_max_turns=10)
     mgr.set("continue project", goal_mode="goal_prompt_oneshot")
 
-    with patch.object(goals, "judge_goal") as judge:
+    with patch.object(goals, "judge_goal") as judge, \
+         patch.object(goals, "judge_goal_slice", return_value=("pass_continue", "slice verified", False, "")):
         decision = mgr.evaluate_after_turn(
             "Judge reasoning: GOAL.md is not satisfied and safe work remains\n"
             "/goal_prompt_oneshot continuation decision: CONTINUE\n"
@@ -842,6 +913,73 @@ def test_oneshot_stop_for_operator_pauses_not_done(hermes_home):
     assert "operator" in (mgr.state.paused_reason or "")
     assert "judge: no safe autonomous slice remains → STOP_FOR_OPERATOR" in decision["message"]
     assert decision["message"].index("no safe autonomous slice remains") < decision["message"].index("STOP_FOR_OPERATOR")
+
+
+
+
+def test_judge_goal_slice_uses_goal_slice_judge_auxiliary_task():
+    from hermes_cli import goals
+
+    captured = {}
+
+    class _FakeMsg:
+        content = '{"verdict": "pass_continue", "reason": "slice complete", "repair_prompt": ""}'
+
+    class _FakeChoice:
+        message = _FakeMsg()
+
+    class _FakeResp:
+        choices = [_FakeChoice()]
+
+    class _FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            captured.update(kwargs)
+            return _FakeResp()
+
+    class _FakeChat:
+        completions = _FakeCompletions()
+
+    class _FakeClient:
+        chat = _FakeChat()
+
+    calls = []
+
+    def fake_get_text_auxiliary_client(task_name):
+        calls.append(task_name)
+        return _FakeClient(), "openrouter/owl-alpha"
+
+    with patch(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        side_effect=fake_get_text_auxiliary_client,
+    ), patch("agent.auxiliary_client.get_auxiliary_extra_body", return_value={}):
+        verdict, reason, parse_failed, repair_prompt = goals.judge_goal_slice(
+            "finish project",
+            "/goal_prompt_oneshot continuation decision: CONTINUE\n"
+            "Verification evidence: pytest passed",
+            proposed_verdict="continue",
+        )
+
+    assert calls == ["goal_slice_judge"]
+    assert captured["model"] == "openrouter/owl-alpha"
+    assert captured["messages"][0]["role"] == "system"
+    assert "slice-quality judge" in captured["messages"][0]["content"]
+    assert "Codex proposed verdict: continue" in captured["messages"][1]["content"]
+    assert verdict == "pass_continue"
+    assert reason == "slice complete"
+    assert parse_failed is False
+    assert repair_prompt == ""
+
+
+def test_parse_slice_judge_response_invalid_json_fails_to_repair():
+    from hermes_cli.goals import _parse_slice_judge_response
+
+    verdict, reason, parse_failed, repair_prompt = _parse_slice_judge_response("not json")
+
+    assert verdict == "repair"
+    assert parse_failed is True
+    assert "not JSON" in reason
+    assert "Repair" in repair_prompt
 
 
 def test_oneshot_judge_uses_mode_aware_prompt(monkeypatch):
